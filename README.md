@@ -44,6 +44,13 @@ Redaktorius leidžia:
 - 📊 Peržiūrėti statistiką
 - ⬇️ Parsisiųsti atnaujintą CSV
 
+### 3. Paleisti testus
+
+```bash
+pip install -r requirements.txt
+python3 -m pytest
+```
+
 ---
 
 ## 📋 VMI operacijų kodai (rusis)
@@ -90,6 +97,17 @@ Taisykles galite redaguoti `rules.yaml` faile.
 ### Valstybės žymėjimas (`valstybe`)
 
 `valstybe` stulpelis nustatomas eilutes lygiu: jei aprasyme randamas ISIN,
-naudojamas jo salies prefiksas (pvz. `US...` -> `US`, `LU...` -> `LU`),
-kitu atveju naudojama numatytoji salis is `rules.yaml` (`country`).
+instrumentas pirmiausia tikrinamas per OpenFIGI API pagal tą ISIN kodą.
+Jei API grąžina šalies kodą, naudojama jis; jei API laikinai nepasiekiamas
+arba negrąžina šalies lauko, naudojamas ISIN prefiksas (pvz. `US...` -> `US`,
+`LU...` -> `LU`). Jei ISIN apskritai nėra, naudojama numatytoji šalis iš
+`rules.yaml` (`country`).
+
+Jei reikia didesnių OpenFIGI limitų, galite nustatyti `OPENFIGI_API_KEY`
+aplinkos kintamąjį prieš paleidžiant `parse_ib.py`.
+
+Kai randamas ISIN, paleidimo metu loge matysite OpenFIGI užklausas ir Docker
+konteinerio loguose, pvz.: `[OpenFIGI] OpenFIGI cache miss for ISIN ...`,
+`[OpenFIGI] Accessing OpenFIGI for ISIN ...`,
+`[OpenFIGI] OpenFIGI resolved ISIN ... -> US` arba fallback / klaidos žinutes.
 

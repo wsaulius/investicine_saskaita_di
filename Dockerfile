@@ -2,9 +2,10 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install system dependencies
+# Install system dependencies (including curl for healthcheck)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
+    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy requirements
@@ -15,12 +16,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app.py .
+COPY parse_ib.py .
 COPY templates/ ./templates/
 COPY static/ ./static/
-COPY output/ ./output/
+COPY rules.yaml .
 
-# Create output directory if it doesn't exist
-RUN mkdir -p /app/output
+# Create necessary directories
+RUN mkdir -p /app/output /app/source
 
 # Expose port
 EXPOSE 5001
@@ -31,4 +33,3 @@ ENV FLASK_ENV=production
 
 # Run the app
 CMD ["python", "-u", "app.py"]
-

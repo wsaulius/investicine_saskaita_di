@@ -12,17 +12,30 @@ Usage:
 
 import argparse
 import csv
+import json
+import logging
 import os
 import re
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
+from urllib import error as urllib_error
+from urllib import request as urllib_request
 
 try:
     from bs4 import BeautifulSoup
 except ImportError:
     BeautifulSoup = None
+
+
+LOGGER = logging.getLogger('parse_ib.openfigi')
+if not LOGGER.handlers:
+    _openfigi_handler = logging.StreamHandler(sys.stdout)
+    _openfigi_handler.setFormatter(logging.Formatter('[OpenFIGI] %(message)s'))
+    LOGGER.addHandler(_openfigi_handler)
+LOGGER.setLevel(logging.INFO)
+LOGGER.propagate = False
 
 
 # ---------------------------------------------------------------------------
@@ -628,8 +641,186 @@ def _contains_any(text: str, needles: list) -> bool:
     return False
 
 
+ISIN_RE = re.compile(r'\b([A-Z]{2}[A-Z0-9]{9}[0-9])\b')
+DEFAULT_OPENFIGI_URL = 'https://api.openfigi.com/v3/mapping'
+COUNTRY_RESPONSE_KEYS = (
+    'country',
+    'countryCode',
+    'country_code',
+    'countryIso2',
+    'country_iso2',
+    'iso2',
+    'domicile',
+    'domicileCountry',
+    'domicile_country',
+)
+
+
+def extract_isin(text: str) -> Optional[str]:
+    """Extract the first ISIN found in free text."""
+    if not text:
+        return None
+    m = ISIN_RE.search(text.upper())
+    return m.group(1) if m else None
+
+
+def _normalize_country_code(value) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    candidate = value.strip().upper()
+    if re.fullmatch(r'[A-Z]{2}', candidate):
+        return candidate
+    return None
+
+
+def _extract_country_from_api_payload(payload) -> Optional[str]:
+    """Search a nested API payload for an ISO-3166 alpha-2 country code."""
+    if isinstance(payload, dict):
+        for key in COUNTRY_RESPONSE_KEYS:
+            country = _normalize_country_code(payload.get(key))
+            if country:
+                return country
+        for value in payload.values():
+            country = _extract_country_from_api_payload(value)
+            if country:
+                return country
+        return None
+
+    if isinstance(payload, list):
+        for item in payload:
+            country = _extract_country_from_api_payload(item)
+            if country:
+                return country
+
+    return None
+
+
+class IsinCountryResolver:
+    """Resolve row country from ISIN metadata with API lookup and safe fallbacks."""
+
+    def __init__(self,
+                 default_country: str,
+                 api_url: Optional[str] = None,
+                 api_key: Optional[str] = None,
+                 timeout: float = 10.0,
+                 api_enabled: bool = True):
+        self.default_country = (default_country or 'LT').upper()
+        self.api_url = api_url or os.getenv('OPENFIGI_API_URL', DEFAULT_OPENFIGI_URL)
+        self.api_key = api_key or os.getenv('OPENFIGI_API_KEY')
+        self.timeout = timeout
+        self.api_enabled = api_enabled
+        self.cache = {}
+
+    def resolve_description(self, description: str) -> str:
+        isin = extract_isin(description)
+        return self.resolve_isin(isin)
+
+    def resolve_isin(self, isin: Optional[str]) -> str:
+        if not isin:
+            return self.default_country
+
+        isin = isin.upper()
+        if isin in self.cache:
+            LOGGER.info('OpenFIGI cache hit for ISIN %s -> %s', isin, self.cache[isin])
+            return self.cache[isin]
+
+        LOGGER.info('OpenFIGI cache miss for ISIN %s', isin)
+        country = None
+        if self.api_enabled:
+            try:
+                LOGGER.info('Accessing OpenFIGI for ISIN %s', isin)
+                payload = self._fetch_isin_metadata(isin)
+                country = _extract_country_from_api_payload(payload)
+                if country:
+                    LOGGER.info('OpenFIGI resolved ISIN %s -> %s', isin, country)
+                else:
+                    LOGGER.info('OpenFIGI returned no country for ISIN %s', isin)
+            except RuntimeError as exc:
+                LOGGER.warning('OpenFIGI lookup failed for ISIN %s: %s', isin, exc)
+
+        if not country:
+            # Fallback to issuer country embedded in the ISIN when the API does not
+            # expose an explicit country field or is temporarily unavailable.
+            country = isin[:2] if ISIN_RE.fullmatch(isin) else self.default_country
+            LOGGER.info('Using fallback country for ISIN %s -> %s', isin, country)
+
+        self.cache[isin] = country
+        return country
+
+    def _fetch_isin_metadata(self, isin: str):
+        payload = json.dumps([{'idType': 'ID_ISIN', 'idValue': isin}]).encode('utf-8')
+        headers = {'Content-Type': 'application/json'}
+        if self.api_key:
+            headers['X-OPENFIGI-APIKEY'] = self.api_key
+
+        request = urllib_request.Request(self.api_url, data=payload, headers=headers, method='POST')
+        try:
+            with urllib_request.urlopen(request, timeout=self.timeout) as response:
+                return json.loads(response.read().decode('utf-8'))
+        except urllib_error.HTTPError as exc:
+            body = exc.read().decode('utf-8', errors='replace') if hasattr(exc, 'read') else ''
+            raise RuntimeError(f'HTTP {exc.code}: {body[:200]}') from exc
+        except urllib_error.URLError as exc:
+            raise RuntimeError(str(exc.reason)) from exc
+        except json.JSONDecodeError as exc:
+            raise RuntimeError('invalid JSON response from ISIN lookup API') from exc
+
+
+def _load_patterns(patterns_path: Optional[str] = None) -> dict:
+    """Load pattern collections from patterns.json.
+    
+    Returns a dict mapping pattern_name -> list of pattern strings.
+    If patterns_path is None, tries to load from 'patterns.json' in current dir.
+    """
+    if patterns_path is None:
+        patterns_path = 'patterns.json'
+    
+    if not os.path.isfile(patterns_path):
+        return {}
+    
+    try:
+        with open(patterns_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        resolved = {}
+        if isinstance(data.get('patterns'), dict):
+            for name, config in data['patterns'].items():
+                if isinstance(config, dict) and 'patterns' in config:
+                    resolved[name] = _as_list(config['patterns'])
+        return resolved
+    except (json.JSONDecodeError, IOError) as e:
+        print(f"Warning: Could not load patterns from {patterns_path}: {e}", file=sys.stderr)
+        return {}
+
+
+def _resolve_pattern_references(value_list: list, patterns: dict) -> list:
+    """Resolve @pattern_name references to actual patterns.
+    
+    Converts:
+        ['@fund_purchases', 'inline_pattern']
+    To:
+        ['pattern1_from_fund_purchases', 'pattern2_from_fund_purchases', 'inline_pattern']
+    """
+    resolved = []
+    for item in _as_list(value_list):
+        item_str = str(item)
+        if item_str.startswith('@'):
+            pattern_name = item_str[1:]  # Remove @ prefix
+            if pattern_name in patterns:
+                resolved.extend(patterns[pattern_name])
+            else:
+                raise RuntimeError(f"Unknown pattern reference: @{pattern_name}")
+        else:
+            resolved.append(item_str)
+    return resolved
+
+
 def load_swedbank_rules(path: Optional[str]) -> dict:
-    """Load optional Swedbank mapping rules from YAML file."""
+    """Load optional Swedbank mapping rules from YAML file.
+    
+    Supports pattern collection references using @pattern_name syntax.
+    Patterns are loaded from patterns.json in the same directory as rules file.
+    """
     rules = default_swedbank_rules()
     if not path:
         return rules
@@ -647,6 +838,11 @@ def load_swedbank_rules(path: Optional[str]) -> dict:
     if not isinstance(loaded, dict):
         raise RuntimeError(f"Invalid rules file (expected mapping): {path}")
 
+    # Load pattern collections from patterns.json (same directory as rules file)
+    rules_dir = os.path.dirname(os.path.abspath(path))
+    patterns_file = os.path.join(rules_dir, 'patterns.json')
+    patterns = _load_patterns(patterns_file)
+
     if 'country' in loaded:
         rules['country'] = str(loaded['country']).upper()
 
@@ -658,7 +854,9 @@ def load_swedbank_rules(path: Optional[str]) -> dict:
         'force_withdrawal_description_contains',
     ):
         if key in loaded:
-            rules[key] = [str(x) for x in _as_list(loaded[key])]
+            raw_list = _as_list(loaded[key])
+            resolved_list = _resolve_pattern_references(raw_list, patterns)
+            rules[key] = [str(x) for x in resolved_list]
 
     if 'action_rules' in loaded:
         action_rules = _as_list(loaded['action_rules'])
@@ -674,7 +872,18 @@ def load_swedbank_rules(path: Optional[str]) -> dict:
                 when = {}
             if not isinstance(when, dict):
                 raise RuntimeError(f"Invalid when in action_rules[{idx}] ({path}): expected mapping")
-            normalized.append({'action': action, 'when': when})
+            
+            # Resolve pattern references in when conditions
+            resolved_when = {}
+            for condition_key, condition_value in when.items():
+                if condition_key in ('description_contains', 'receiver_contains'):
+                    resolved_when[condition_key] = _resolve_pattern_references(
+                        _as_list(condition_value), patterns
+                    )
+                else:
+                    resolved_when[condition_key] = condition_value
+            
+            normalized.append({'action': action, 'when': resolved_when})
         rules['action_rules'] = normalized
 
     return rules
@@ -844,18 +1053,9 @@ def detect_broker(input_path: str) -> str:
 
 
 def resolve_country_from_instrument_id(description: str, default_country: str) -> str:
-    """Resolve country code from instrument ID (ISIN) in free text.
-
-    Uses ISIN prefix (first two letters), e.g. US00123... -> US, LU04467... -> LU.
-    Falls back to default country when no ISIN is present.
-    """
-    if not description:
-        return default_country
-
-    m = re.search(r'\b([A-Z]{2}[A-Z0-9]{9}[0-9])\b', description.upper())
-    if m:
-        return m.group(1)[:2]
-    return default_country
+    """Resolve country code from free text using ISIN metadata lookup when available."""
+    resolver = IsinCountryResolver(default_country=default_country)
+    return resolver.resolve_description(description)
 
 
 # ---------------------------------------------------------------------------
@@ -1178,7 +1378,8 @@ def generate_readable_report(stmt: ParsedStatement, output_path: str):
 def generate_vmi_csv(stmt: ParsedStatement, output_path: str, year: int,
                      declaration_start_date: Optional[str] = None,
                      balance_stmt: Optional[ParsedStatement] = None,
-                     country: str = 'IE'):
+                     country: str = 'IE',
+                     country_resolver: Optional[IsinCountryResolver] = None):
     """Generate VMI CSV for investment account declaration.
 
     VMI codes (rusis):
@@ -1201,6 +1402,7 @@ def generate_vmi_csv(stmt: ParsedStatement, output_path: str, year: int,
 
     rates = get_currency_to_usd_rates(stmt)
     rows = []
+    country_resolver = country_resolver or IsinCountryResolver(default_country=country)
 
     # If declaration_start_date provided, add IA (cash) and IS (positions cost basis)
     # as ONE consolidated row each (pre-2025 balances are not itemized)
@@ -1249,7 +1451,7 @@ def generate_vmi_csv(stmt: ParsedStatement, output_path: str, year: int,
     # Add each deposit/withdrawal as individual row
     for dw in stmt.deposits_withdrawals:
         amount_eur = native_to_eur(dw.amount, dw.currency, rates, eur_rate)
-        row_country = resolve_country_from_instrument_id(dw.description, country)
+        row_country = country_resolver.resolve_description(dw.description)
         # Positive = deposit (II), negative = withdrawal (PP)
         if dw.amount >= 0:
             code = 'II'
@@ -1269,7 +1471,7 @@ def generate_vmi_csv(stmt: ParsedStatement, output_path: str, year: int,
     # Add each dividend as deposit (IV) - dividends received into investment account
     for div in stmt.dividends:
         amount_eur = native_to_eur(div.amount, div.currency, rates, eur_rate)
-        row_country = resolve_country_from_instrument_id(div.description, country)
+        row_country = country_resolver.resolve_description(div.description)
         rows.append({
             'saskaita': stmt.account_id,
             'rusis': 'IV',

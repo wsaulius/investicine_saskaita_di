@@ -1,5 +1,13 @@
 # Swedbank -> VMI mapping rules
 # Actions: II, PP, IV, IGNORE, AUTO
+# 
+# Pattern collections can be defined in patterns.json and referenced here by name.
+# Use @pattern_name syntax to reference a pattern collection.
+#
+# Example:
+#   description_contains:
+#     - "@fund_purchases"       # References pattern collection 'fund_purchases' from patterns.json
+#     - "custom_literal"        # Inline literals still work
 
 country: LT
 
@@ -16,44 +24,46 @@ exclude_codes:
 exclude_description_contains: []
 
 # Rows containing these snippets and positive amounts become IV.
+# Can reference patterns from patterns.json or use inline literals.
 dividend_description_contains:
-  - DIVIDENDAI
+  - "@dividends"
 
 # Optional forced classes by description.
 force_deposit_description_contains: []
 force_withdrawal_description_contains: []
 
 # Ordered, first-match rules. Use action=AUTO to continue to fallback logic.
+# Pattern collections (@pattern_name) resolve to all patterns in that collection.
 action_rules:
   - action: II
     when:
       code: M
       description_contains:
-        - FONDŲ PIRKIMAS
+        - "@fund_purchases"
 
   - action: II
     when:
       code: MK
       receiver_contains:
-        - SYNERGY FINANCE
+        - "@fund_providers"
 
   - action: II
     when:
       code: MK
       description_contains:
-        - rontgen.lt
+        - "@real_estate"
 
-  # Example: pension contributions are not part of investment-account flows.
+  # Pension contributions are not part of investment-account flows.
   - action: IGNORE
     when:
       code: MK
       description_contains:
-        - III pakopos pensiju fondo imoka
+        - "@pension_contributions"
 
-  # Example: if needed, force known broker redemptions to II.
+  # Fund redemptions/sales.
   - action: II
     when:
       code: MK
       description_contains:
-        - Uz isperkamus Fondo vienetus
+        - "@fund_redemptions"
 
