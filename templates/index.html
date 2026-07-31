@@ -1,0 +1,350 @@
+<!DOCTYPE html>
+<html lang="lt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VMI Investicinės sąskaitos redaktorius</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>📊 VMI Investicinės sąskaitos CSV redaktorius</h1>
+            <p class="subtitle">Redaguokite operacijos kodus (rusis) tiesiogiai iš žiniatinklio</p>
+        </header>
+
+        <div class="controls">
+            <div class="control-group">
+                <label for="filter-code">Filtruoti pagal kodą:</label>
+                <select id="filter-code">
+                    <option value="">Visi kodai</option>
+                    {% for code, label in vmi_codes.items() %}
+                        <option value="{{ code }}">{{ code }} - {{ label }}</option>
+                    {% endfor %}
+                </select>
+            </div>
+
+            <div class="control-group">
+                <label for="filter-country">Filtruoti pagal šalį:</label>
+                <select id="filter-country">
+                    <option value="">Visos šalys</option>
+                </select>
+            </div>
+
+            <div class="control-group">
+                <button id="btn-export" class="btn btn-primary">⬇️ Parsisiųsti CSV</button>
+                <button id="btn-refresh" class="btn btn-secondary">🔄 Atnaujinti</button>
+                <button id="btn-stats" class="btn btn-secondary">📈 Statistika</button>
+            </div>
+        </div>
+
+        <div class="stats-bar" id="stats">
+            Iš viso eilučių: <strong id="stat-total">{{ total_rows }}</strong>
+        </div>
+
+        <div class="table-wrapper">
+            <table id="data-table">
+                <thead>
+                    <tr>
+                        <th>Sąskaita</th>
+                        <th>Kodas (rusis)</th>
+                        <th>Data</th>
+                        <th>Suma (EUR)</th>
+                        <th>Šalis</th>
+                        <th>Aprašymas</th>
+                        <th>Veiksmas</th>
+                    </tr>
+                </thead>
+                <tbody id="table-body">
+                    <!-- Populated by JavaScript -->
+                </tbody>
+            </table>
+        </div>
+
+        <div class="footer">
+            <p>Pagalba: Pasirinkite kodą iš sąrašo ir spustelėkite "Išsaugoti"</p>
+        </div>
+    </div>
+
+    <!-- Stats Modal -->
+    <div id="stats-modal" class="modal">
+        <div class="modal-content">
+            <span class="close">&times;</span>
+            <h2>Statistika</h2>
+            <div id="stats-content"></div>
+        </div>
+    </div>
+
+    <script>
+        const VMI_CODES = {
+            {% for code, label in vmi_codes.items() %}
+                '{{ code }}': '{{ label }}'{{ "," if not loop.last else "" }}
+            {% endfor %}
+        };
+
+        let allRows = [];
+        let filteredRows = [];
+
+        // Load data on page load
+        document.addEventListener('DOMContentLoaded', function() {
+            loadRows();
+            setupEventListeners();
+        });
+
+        async function loadRows() {
+            try {
+                const response = await fetch('/api/rows');
+                allRows = await response.json();
+                allRows.forEach(row => {
+                    if (!row._uiState) {
+                        row._uiState = 'default';
+                    }
+                });
+                renderTable(allRows);
+                populateCountryFilter();
+            } catch (error) {
+                console.error('Error loading rows:', error);
+                alert('Klaida įkeliant duomenis');
+            }
+        }
+
+        function populateCountryFilter() {
+            const select = document.getElementById('filter-country');
+            const currentValue = select.value;
+
+            // Reset options to avoid duplicates when refreshing data.
+            select.innerHTML = '';
+            const defaultOption = document.createElement('option');
+            defaultOption.value = '';
+            defaultOption.textContent = 'Visos šalys';
+            select.appendChild(defaultOption);
+
+            const countries = [...new Set(allRows.map(r => (r.valstybe || '').trim()).filter(Boolean))].sort();
+            countries.forEach(country => {
+                const option = document.createElement('option');
+                option.value = country;
+                option.textContent = country;
+                select.appendChild(option);
+            });
+
+            if (currentValue && countries.includes(currentValue)) {
+                select.value = currentValue;
+            }
+        }
+
+        function renderTable(rows) {
+            const tbody = document.getElementById('table-body');
+            tbody.innerHTML = '';
+
+            rows.forEach((row, idx) => {
+                const tr = document.createElement('tr');
+                tr.className = `code-${row.rusis}`;
+                tr.dataset.rowId = row._id;
+
+                const description = (row.aprasymas || '').substring(0, 60) +
+                                   ((row.aprasymas || '').length > 60 ? '...' : '');
+
+                tr.innerHTML = `
+                    <td>${row.saskaita}</td>
+                    <td class="code-cell">
+                        <select class="code-select" data-row-id="${row._id}">
+                            ${Object.keys(VMI_CODES).map(code =>
+                                `<option value="${code}" ${code === row.rusis ? 'selected' : ''}>
+                                    ${code}
+                                </option>`
+                            ).join('')}
+                        </select>
+                    </td>
+                    <td>${row.data}</td>
+                    <td class="amount">${parseFloat(row.suma).toFixed(2)}</td>
+                    <td>${row.valstybe}</td>
+                    <td class="description" title="${row.aprasymas}">${description}</td>
+                    <td>
+                        <button class="btn-save" data-row-id="${row._id}" title="Išsaugoti pakeitimą">○</button>
+                    </td>
+                `;
+
+                tbody.appendChild(tr);
+                setSaveButtonState(tr.querySelector('.btn-save'), row._uiState || 'default');
+            });
+
+            // Attach event listeners to save buttons
+            document.querySelectorAll('.btn-save').forEach(btn => {
+                btn.addEventListener('click', function() {
+                    const rowId = parseInt(this.dataset.rowId);
+                    const rowEl = this.closest('tr');
+                    const select = rowEl ? rowEl.querySelector('.code-select') : null;
+                    if (!select) {
+                        alert('Nepavyko rasti kodo pasirinkimo laukelio.');
+                        return;
+                    }
+
+                    const row = allRows.find(r => r._id === rowId);
+                    if (row && select.value === row.rusis) {
+                        if (row) row._uiState = 'default';
+                        setSaveButtonState(this, 'default');
+                        return;
+                    }
+
+                    setSaveButtonState(this, 'saving');
+                    updateRow(rowId, select.value);
+                });
+            });
+
+            // Manual-save mode: dropdown change only marks row as dirty.
+            document.querySelectorAll('.code-select').forEach(select => {
+                select.addEventListener('change', function() {
+                    const rowId = parseInt(this.dataset.rowId);
+                    const btn = this.closest('tr').querySelector('.btn-save');
+                    const row = allRows.find(r => r._id === rowId);
+                    if (row && this.value !== row.rusis) {
+                        row._uiState = 'dirty';
+                        setSaveButtonState(btn, 'dirty');
+                    } else {
+                        if (row) row._uiState = 'default';
+                        setSaveButtonState(btn, 'default');
+                    }
+                });
+            });
+        }
+
+        function setSaveButtonState(btn, state) {
+            if (!btn) return;
+
+            btn.classList.remove('is-saved', 'is-saving', 'is-error', 'is-dirty');
+            switch (state) {
+                case 'saving':
+                    btn.classList.add('is-saving');
+                    btn.textContent = '⏳';
+                    btn.title = 'Saugoma...';
+                    break;
+                case 'saved':
+                    btn.classList.add('is-saved');
+                    btn.textContent = '✓';
+                    btn.title = 'Išsaugota';
+                    break;
+                case 'error':
+                    btn.classList.add('is-error');
+                    btn.textContent = '✗';
+                    btn.title = 'Klaida saugant';
+                    break;
+                case 'dirty':
+                    btn.classList.add('is-dirty');
+                    btn.textContent = '•';
+                    btn.title = 'Yra neišsaugotų pakeitimų';
+                    break;
+                default:
+                    btn.textContent = '○';
+                    btn.title = 'Išsaugoti pakeitimą';
+            }
+        }
+
+        async function updateRow(rowId, newCode) {
+            try {
+                const response = await fetch('/api/update', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ id: rowId, rusis: newCode })
+                });
+
+                if (!response.ok) {
+                    const err = await response.json().catch(() => ({}));
+                    throw new Error(err.error || 'Update failed');
+                }
+
+                const result = await response.json();
+
+                // Update local data
+                const row = allRows.find(r => r._id === rowId);
+                if (row) {
+                    row.rusis = newCode;
+                    row._uiState = 'saved';
+                }
+
+                // Visual feedback
+                const selectEl = document.querySelector(`.code-select[data-row-id="${rowId}"]`);
+                const btn = selectEl ? selectEl.closest('tr').querySelector('.btn-save') : null;
+                if (btn) {
+                    setSaveButtonState(btn, 'saved');
+                }
+
+                applyFilters();
+            } catch (error) {
+                const row = allRows.find(r => r._id === rowId);
+                if (row) row._uiState = 'error';
+                const selectEl = document.querySelector(`.code-select[data-row-id="${rowId}"]`);
+                const btn = selectEl ? selectEl.closest('tr').querySelector('.btn-save') : null;
+                setSaveButtonState(btn, 'error');
+                console.error('Error updating row:', error);
+                alert(`Klaida atnaujinant eilutę: ${error.message}`);
+            }
+        }
+
+        function setupEventListeners() {
+            document.getElementById('filter-code').addEventListener('change', applyFilters);
+            document.getElementById('filter-country').addEventListener('change', applyFilters);
+            document.getElementById('btn-export').addEventListener('click', exportCSV);
+            document.getElementById('btn-refresh').addEventListener('click', loadRows);
+            document.getElementById('btn-stats').addEventListener('click', showStats);
+
+            // Modal close
+            document.querySelector('.close').addEventListener('click', function() {
+                document.getElementById('stats-modal').style.display = 'none';
+            });
+            window.addEventListener('click', function(event) {
+                const modal = document.getElementById('stats-modal');
+                if (event.target === modal) modal.style.display = 'none';
+            });
+        }
+
+        function applyFilters() {
+            const codeFilter = document.getElementById('filter-code').value;
+            const countryFilter = document.getElementById('filter-country').value;
+
+            filteredRows = allRows.filter(row => {
+                if (codeFilter && row.rusis !== codeFilter) return false;
+                if (countryFilter && row.valstybe !== countryFilter) return false;
+                return true;
+            });
+
+            renderTable(filteredRows);
+        }
+
+        async function exportCSV() {
+            window.location.href = '/api/export';
+        }
+
+        async function showStats() {
+            try {
+                const response = await fetch('/api/stats');
+                const stats = await response.json();
+
+                let html = `
+                    <p><strong>Iš viso eilučių:</strong> ${stats.total}</p>
+                    <h3>Pagal kodą (rusis):</h3>
+                    <ul>
+                `;
+
+                Object.entries(stats.by_code).forEach(([code, count]) => {
+                    html += `<li>${code}: ${count}</li>`;
+                });
+
+                html += `</ul><h3>Pagal šalį:</h3><ul>`;
+
+                Object.entries(stats.by_country).forEach(([country, count]) => {
+                    html += `<li>${country}: ${count}</li>`;
+                });
+
+                html += `</ul>`;
+
+                document.getElementById('stats-content').innerHTML = html;
+                document.getElementById('stats-modal').style.display = 'block';
+            } catch (error) {
+                console.error('Error loading stats:', error);
+                alert('Klaida įkeliant statistiką');
+            }
+        }
+    </script>
+</body>
+</html>
+

@@ -1,0 +1,4 @@
+beautifulsoup4
+pyyaml
+flask>=2.0.0
+

@@ -1,0 +1,59 @@
+# Swedbank -> VMI mapping rules
+# Actions: II, PP, IV, IGNORE, AUTO
+
+country: LT
+
+# Whole Swedbank codes to ignore by default.
+exclude_codes:
+  - AS
+  - LS
+  - K2
+  - M
+  - TT
+  - X
+
+# Optional extra text filters.
+exclude_description_contains: []
+
+# Rows containing these snippets and positive amounts become IV.
+dividend_description_contains:
+  - DIVIDENDAI
+
+# Optional forced classes by description.
+force_deposit_description_contains: []
+force_withdrawal_description_contains: []
+
+# Ordered, first-match rules. Use action=AUTO to continue to fallback logic.
+action_rules:
+  - action: II
+    when:
+      code: M
+      description_contains:
+        - FONDŲ PIRKIMAS
+
+  - action: II
+    when:
+      code: MK
+      receiver_contains:
+        - SYNERGY FINANCE
+
+  - action: II
+    when:
+      code: MK
+      description_contains:
+        - rontgen.lt
+
+  # Example: pension contributions are not part of investment-account flows.
+  - action: IGNORE
+    when:
+      code: MK
+      description_contains:
+        - III pakopos pensiju fondo imoka
+
+  # Example: if needed, force known broker redemptions to II.
+  - action: II
+    when:
+      code: MK
+      description_contains:
+        - Uz isperkamus Fondo vienetus
+

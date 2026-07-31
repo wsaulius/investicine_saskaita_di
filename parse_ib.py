@@ -19,7 +19,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Optional
 
-from bs4 import BeautifulSoup
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 
 # ---------------------------------------------------------------------------
@@ -560,6 +563,9 @@ def parse_corporate_actions(soup, account_id):
 
 def parse_statement(html_path: str) -> ParsedStatement:
     """Parse an IB activity statement HTML file."""
+    if BeautifulSoup is None:
+        raise RuntimeError("BeautifulSoup4 is required for IB HTML parsing. Install with: pip install beautifulsoup4")
+
     with open(html_path, 'r', encoding='utf-8') as f:
         soup = BeautifulSoup(f.read(), 'html.parser')
 
@@ -591,6 +597,265 @@ def parse_statement(html_path: str) -> ParsedStatement:
     stmt.derived_fx_rates = derived_rates
 
     return stmt
+
+
+def default_swedbank_rules() -> dict:
+    """Default Swedbank mapping rules for II/PP/IV classification."""
+    return {
+        'country': 'LT',
+        'exclude_codes': ['AS', 'LS', 'K2', 'M', 'TT', 'X'],
+        'exclude_description_contains': [],
+        'dividend_description_contains': ['DIVIDENDAI'],
+        'force_deposit_description_contains': [],
+        'force_withdrawal_description_contains': [],
+        'action_rules': [],
+    }
+
+
+def _as_list(value):
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def _contains_any(text: str, needles: list) -> bool:
+    text_cf = (text or '').casefold()
+    for needle in needles:
+        if str(needle).casefold() in text_cf:
+            return True
+    return False
+
+
+def load_swedbank_rules(path: Optional[str]) -> dict:
+    """Load optional Swedbank mapping rules from YAML file."""
+    rules = default_swedbank_rules()
+    if not path:
+        return rules
+
+    try:
+        import yaml
+    except ImportError as e:
+        raise RuntimeError(
+            "PyYAML is required for --swedbank-rules. Install with: pip install pyyaml"
+        ) from e
+
+    with open(path, 'r', encoding='utf-8') as f:
+        loaded = yaml.safe_load(f) or {}
+
+    if not isinstance(loaded, dict):
+        raise RuntimeError(f"Invalid rules file (expected mapping): {path}")
+
+    if 'country' in loaded:
+        rules['country'] = str(loaded['country']).upper()
+
+    for key in (
+        'exclude_codes',
+        'exclude_description_contains',
+        'dividend_description_contains',
+        'force_deposit_description_contains',
+        'force_withdrawal_description_contains',
+    ):
+        if key in loaded:
+            rules[key] = [str(x) for x in _as_list(loaded[key])]
+
+    if 'action_rules' in loaded:
+        action_rules = _as_list(loaded['action_rules'])
+        normalized = []
+        for idx, raw in enumerate(action_rules):
+            if not isinstance(raw, dict):
+                raise RuntimeError(f"Invalid action_rules[{idx}] in {path}: expected mapping")
+            action = str(raw.get('action', 'AUTO')).upper()
+            if action not in {'II', 'PP', 'IV', 'IGNORE', 'AUTO'}:
+                raise RuntimeError(f"Invalid action '{action}' in action_rules[{idx}] ({path})")
+            when = raw.get('when', {})
+            if when is None:
+                when = {}
+            if not isinstance(when, dict):
+                raise RuntimeError(f"Invalid when in action_rules[{idx}] ({path}): expected mapping")
+            normalized.append({'action': action, 'when': when})
+        rules['action_rules'] = normalized
+
+    return rules
+
+
+def _swedbank_rule_matches(code: str, dk: str, currency: str, desc: str, receiver: str, when: dict) -> bool:
+    """Return True when a row matches an action-rule condition."""
+    if 'code' in when and str(when['code']).upper() != code:
+        return False
+    if 'codes' in when:
+        codes = {str(x).upper() for x in _as_list(when['codes'])}
+        if code not in codes:
+            return False
+    if 'dk' in when and str(when['dk']).upper() != dk:
+        return False
+    if 'currency' in when and str(when['currency']).upper() != currency:
+        return False
+    if 'description_contains' in when and not _contains_any(desc, _as_list(when['description_contains'])):
+        return False
+    if 'receiver_contains' in when and not _contains_any(receiver, _as_list(when['receiver_contains'])):
+        return False
+    return True
+
+
+def classify_swedbank_row(code: str, dk: str, currency: str, desc: str,
+                          receiver: str, signed_amount: float, rules: dict) -> Optional[str]:
+    """Classify a Swedbank row into IV/II/PP/IGNORE using configurable rules."""
+    code = (code or '').upper()
+    dk = (dk or '').upper()
+    currency = (currency or '').upper()
+
+    # Highest priority: explicit ordered action rules.
+    for rule in rules.get('action_rules', []):
+        when = rule.get('when', {})
+        if _swedbank_rule_matches(code, dk, currency, desc, receiver, when):
+            action = rule.get('action', 'AUTO').upper()
+            if action == 'AUTO':
+                break
+            if action == 'IGNORE':
+                return None
+            return action
+
+    # Built-in/default fallback mapping.
+    if not code:
+        return None
+    if code in {c.upper() for c in rules.get('exclude_codes', [])}:
+        return None
+    if _contains_any(desc, rules.get('exclude_description_contains', [])):
+        return None
+    if _contains_any(desc, rules.get('dividend_description_contains', [])) and signed_amount > 0:
+        return 'IV'
+    if _contains_any(desc, rules.get('force_deposit_description_contains', [])):
+        return 'II'
+    if _contains_any(desc, rules.get('force_withdrawal_description_contains', [])):
+        return 'PP'
+    return 'II' if signed_amount >= 0 else 'PP'
+
+
+def parse_swedbank_csv(csv_path: str, rules: Optional[dict] = None) -> ParsedStatement:
+    """Parse Swedbank CSV export into normalized ParsedStatement structure."""
+    rules = rules or default_swedbank_rules()
+    stmt = ParsedStatement()
+    opening_balances = {}
+    all_dates = []
+    eur_usd_rate = 0.0
+
+    with open(csv_path, 'r', encoding='utf-8-sig', newline='') as f:
+        reader = csv.DictReader(f, delimiter=';')
+        for row in reader:
+            account_id = (row.get('Sąskaitos Nr.') or '').strip()
+            date = (row.get('Data') or '').strip()
+            receiver = (row.get('Gavėjas') or '').strip()
+            desc = (row.get('Paaiškinimai') or '').strip()
+            amount = parse_number((row.get('Suma') or '').strip())
+            currency = (row.get('Valiuta') or '').strip().upper()
+            dk = (row.get('D/K') or '').strip().upper()
+            code = (row.get('Kodas') or '').strip().upper()
+
+            if account_id and not stmt.account_id:
+                stmt.account_id = account_id
+            if date:
+                all_dates.append(date)
+
+            # Track opening balances for IA fallback.
+            if code == 'AS' and currency:
+                opening_balances[currency] = opening_balances.get(currency, 0.0) + amount
+
+            # Parse FX rates from conversion descriptions such as "kursas 1.1994".
+            if code == 'X' and desc:
+                m = re.search(r'kursas\s+([0-9]+(?:[\.,][0-9]+)?)', desc, flags=re.IGNORECASE)
+                if m:
+                    eur_usd_rate = parse_number(m.group(1).replace(',', '.'))
+
+            signed_amount = amount if dk == 'K' else -amount
+
+            action = classify_swedbank_row(code, dk, currency, desc, receiver, signed_amount, rules)
+            if action is None:
+                continue
+            if action == 'IV':
+                stmt.dividends.append(Dividend(
+                    date=date,
+                    description=desc,
+                    amount=abs(signed_amount),
+                    currency=currency or 'EUR'
+                ))
+                continue
+
+            if action == 'II':
+                normalized_amount = abs(signed_amount)
+            elif action == 'PP':
+                normalized_amount = -abs(signed_amount)
+            else:
+                normalized_amount = signed_amount
+
+            stmt.deposits_withdrawals.append(DepositWithdrawal(
+                date=date,
+                description=desc,
+                amount=normalized_amount,
+                currency=currency or 'EUR'
+            ))
+
+    if all_dates:
+        stmt.period_start = min(all_dates)
+        stmt.period_end = max(all_dates)
+
+    stmt.base_currency = 'EUR' if 'EUR' in opening_balances else (next(iter(opening_balances.keys()), 'EUR'))
+    stmt.eur_usd_rate = eur_usd_rate if eur_usd_rate > 0 else 1.0
+
+    # Keep a minimal cash snapshot from opening balances so IA can be generated if requested.
+    for cur, qty in opening_balances.items():
+        if cur == 'USD':
+            value_usd = qty
+            close_price = 1.0
+        elif cur == 'EUR':
+            value_usd = qty * stmt.eur_usd_rate
+            close_price = stmt.eur_usd_rate
+        else:
+            value_usd = qty
+            close_price = 0.0
+        stmt.forex_balances.append(ForexBalance(
+            currency=cur,
+            quantity=qty,
+            cost_price=0.0,
+            cost_basis_usd=value_usd,
+            close_price=close_price,
+            value_usd=value_usd,
+            unrealized_pl_usd=0.0
+        ))
+
+    return stmt
+
+
+def detect_broker(input_path: str) -> str:
+    """Best-effort broker detection from file extension/header."""
+    lower = input_path.lower()
+    if lower.endswith(('.htm', '.html')):
+        return 'ib'
+    if lower.endswith('.csv'):
+        try:
+            with open(input_path, 'r', encoding='utf-8-sig') as f:
+                header = f.readline()
+            if 'Sąskaitos Nr.' in header:
+                return 'swedbank'
+        except OSError:
+            pass
+    return 'ib'
+
+
+def resolve_country_from_instrument_id(description: str, default_country: str) -> str:
+    """Resolve country code from instrument ID (ISIN) in free text.
+
+    Uses ISIN prefix (first two letters), e.g. US00123... -> US, LU04467... -> LU.
+    Falls back to default country when no ISIN is present.
+    """
+    if not description:
+        return default_country
+
+    m = re.search(r'\b([A-Z]{2}[A-Z0-9]{9}[0-9])\b', description.upper())
+    if m:
+        return m.group(1)[:2]
+    return default_country
 
 
 # ---------------------------------------------------------------------------
@@ -912,7 +1177,8 @@ def generate_readable_report(stmt: ParsedStatement, output_path: str):
 
 def generate_vmi_csv(stmt: ParsedStatement, output_path: str, year: int,
                      declaration_start_date: Optional[str] = None,
-                     balance_stmt: Optional[ParsedStatement] = None):
+                     balance_stmt: Optional[ParsedStatement] = None,
+                     country: str = 'IE'):
     """Generate VMI CSV for investment account declaration.
 
     VMI codes (rusis):
@@ -934,8 +1200,6 @@ def generate_vmi_csv(stmt: ParsedStatement, output_path: str, year: int,
         eur_rate = 1.0
 
     rates = get_currency_to_usd_rates(stmt)
-    country = 'IE'  # Interactive Brokers Ireland
-
     rows = []
 
     # If declaration_start_date provided, add IA (cash) and IS (positions cost basis)
@@ -985,6 +1249,7 @@ def generate_vmi_csv(stmt: ParsedStatement, output_path: str, year: int,
     # Add each deposit/withdrawal as individual row
     for dw in stmt.deposits_withdrawals:
         amount_eur = native_to_eur(dw.amount, dw.currency, rates, eur_rate)
+        row_country = resolve_country_from_instrument_id(dw.description, country)
         # Positive = deposit (II), negative = withdrawal (PP)
         if dw.amount >= 0:
             code = 'II'
@@ -997,19 +1262,20 @@ def generate_vmi_csv(stmt: ParsedStatement, output_path: str, year: int,
             'rusis': code,
             'data': dw.date,
             'suma': f'{amount_eur:.2f}',
-            'valstybe': country,
+            'valstybe': row_country,
             '_description': f'{dw.description} ({dw.currency} {dw.amount:,.2f})'
         })
 
     # Add each dividend as deposit (IV) - dividends received into investment account
     for div in stmt.dividends:
         amount_eur = native_to_eur(div.amount, div.currency, rates, eur_rate)
+        row_country = resolve_country_from_instrument_id(div.description, country)
         rows.append({
             'saskaita': stmt.account_id,
             'rusis': 'IV',
             'data': div.date,
             'suma': f'{amount_eur:.2f}',
-            'valstybe': country,
+            'valstybe': row_country,
             '_description': f'Dividendas: {div.description} ({div.currency} {div.amount:,.2f})'
         })
 
@@ -1041,10 +1307,14 @@ def generate_vmi_csv(stmt: ParsedStatement, output_path: str, year: int,
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description='Parse IB activity statements for VMI')
-    parser.add_argument('input', help='Path to IB HTM activity statement')
+    parser = argparse.ArgumentParser(description='Parse broker statements for VMI')
+    parser.add_argument('input', help='Path to broker statement (IB HTM/HTML or Swedbank CSV)')
     parser.add_argument('--year', type=int, default=None,
                         help='Tax year (default: extracted from statement)')
+    parser.add_argument('--broker', choices=['auto', 'ib', 'swedbank'], default='auto',
+                        help='Input broker format (default: auto detect)')
+    parser.add_argument('--swedbank-rules', default=None,
+                        help='Path to YAML rules for Swedbank transaction mapping')
     parser.add_argument('--output-dir', default='output',
                         help='Output directory (default: output)')
     parser.add_argument('--declaration-start', default=None,
@@ -1059,8 +1329,17 @@ def main():
         print(f"Error: File not found: {args.input}")
         sys.exit(1)
 
+    broker = detect_broker(args.input) if args.broker == 'auto' else args.broker
     print(f"Parsing: {args.input}")
-    stmt = parse_statement(args.input)
+    print(f"Detected broker: {broker}")
+
+    if broker == 'swedbank':
+        swedbank_rules = load_swedbank_rules(args.swedbank_rules)
+        stmt = parse_swedbank_csv(args.input, rules=swedbank_rules)
+        country = swedbank_rules.get('country', 'LT')
+    else:
+        stmt = parse_statement(args.input)
+        country = 'IE'
 
     year = args.year or int(stmt.period_end[:4])
     print(f"Account: {stmt.account_id} ({stmt.account_name})")
@@ -1074,7 +1353,10 @@ def main():
     balance_stmt = None
     if args.balance_statement:
         print(f"\nParsing balance statement: {args.balance_statement}")
-        balance_stmt = parse_statement(args.balance_statement)
+        if broker == 'swedbank':
+            balance_stmt = parse_swedbank_csv(args.balance_statement, rules=swedbank_rules)
+        else:
+            balance_stmt = parse_statement(args.balance_statement)
         print(f"Balance date: {balance_stmt.period_end}")
         print(f"Balance EUR/USD rate: {balance_stmt.eur_usd_rate}")
         if balance_stmt.derived_fx_rates:
@@ -1091,7 +1373,8 @@ def main():
     csv_path = os.path.join(args.output_dir, f'vmi_{year}.csv')
     rows = generate_vmi_csv(stmt, csv_path, year,
                             declaration_start_date=args.declaration_start,
-                            balance_stmt=balance_stmt)
+                            balance_stmt=balance_stmt,
+                            country=country)
     annotated_path = csv_path.replace('.csv', '_annotated.csv')
     print(f"VMI CSV: {csv_path}")
     print(f"VMI CSV (annotated): {annotated_path}")
