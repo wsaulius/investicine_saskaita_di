@@ -1,0 +1,54 @@
+{
+  "patterns": {
+    "real_estate": {
+      "type": "literal",
+      "description": "Real estate/property investment platforms",
+      "patterns": [
+        "rontgen.lt"
+      ]
+    },
+    "fund_providers": {
+      "type": "literal",
+      "description": "Investment fund providers",
+      "patterns": [
+        "SYNERGY FINANCE",
+        "Synergy Finance"
+      ]
+    },
+    "fund_purchases": {
+      "type": "literal",
+      "description": "Fund purchase keywords",
+      "patterns": [
+        "FONDŲ PIRKIMAS",
+        "Fondų pirkimas",
+        "Uz igijamus fondo vienetus",
+        "Už įsigyjamus fondo vienetus"
+      ]
+    },
+    "fund_redemptions": {
+      "type": "literal",
+      "description": "Fund redemption/sale keywords",
+      "patterns": [
+        "Uz isperkamus Fondo vienetus",
+        "Už išperkamus Fodo vienetus",
+        "Už išperkamus Fondo vienetus"
+      ]
+    },
+    "pension_contributions": {
+      "type": "literal",
+      "description": "Pension fund contributions to exclude",
+      "patterns": [
+        "III pakopos pensiju",
+        "III pakopos pensijų"
+      ]
+    },
+    "dividends": {
+      "type": "literal",
+      "description": "Dividend payment keywords",
+      "patterns": [
+        "DIVIDENDAI"
+      ]
+    }
+  }
+}
+

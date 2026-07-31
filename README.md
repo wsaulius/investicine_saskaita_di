@@ -44,6 +44,31 @@ Redaktorius leidžia:
 - 📊 Peržiūrėti statistiką
 - ⬇️ Parsisiųsti atnaujintą CSV
 
+### 3. Paleisti testus
+
+```bash
+pip install -r requirements.txt
+python3 -m pytest
+```
+
+---
+
+## ✅ Kas patobulinta šiame projekte
+
+- Pridėtas **Swedbank CSV palaikymas** šalia Interactive Brokers HTM ataskaitų, su brokerio auto-detekcija ir tuo pačiu VMI eksporto srautu.
+- Įdiegtas **konfigūruojamas operacijų klasifikavimo sluoksnis** per `rules.yaml`, leidžiantis lanksčiai žymėti operacijas kaip `II`, `IV`, `PP` arba ignoruoti.
+- Pridėtos **pakartotinai naudojamos pattern kolekcijos** per `patterns.json`, kad taisyklėse būtų galima naudoti `@pattern_name` nuorodas vietoje pasikartojančių literalų.
+- Įdiegta **ISIN pagrindu veikianti šalies (`valstybe`) rezoliucija** per OpenFIGI API, su cache, fallback logika ir aiškiais log pranešimais.
+- Sukurtas **Flask GUI redaktorius**, leidžiantis peržiūrėti sugeneruotą anotuotą CSV, ranka koreguoti `rusis`, filtruoti eilutes, matyti statistiką ir eksportuoti rezultatą.
+- Patobulintas GUI veikimo modelis į **manual-save** režimą: pakeitimai pažymimi, o išsaugojimas vyksta tik paspaudus veiksmų mygtuką.
+- Sutvarkytas **eilutės būsenų atvaizdavimas GUI**: taškas (`•`) neįrašytam pakeitimui, varnelė (`✓`) sėkmingam įrašymui, kryžiukas (`✗`) klaidai.
+- Pašalintos **šalių filtravimo dubliavimo problemos** GUI ir išlaikyta mygtukų būsena po filtravimo ar lentelės perpiešimo.
+- Projektas **dockerizuotas** per `Dockerfile`, `docker-compose.yml` ir `start-docker.sh`, kad Flask redaktorių būtų galima paleisti konteineryje.
+- Pakeistas Flask portas į **5001**, kad būtų išvengta tipinio macOS konflikto su 5000 portu.
+- Pridėtas **OpenFIGI logavimas**, matomas tiek lokaliame paleidime, tiek Docker konteinerio loguose.
+- Sukurtas **pytest testų rinkinys** Swedbank parseriui, taisyklėms, pattern kolekcijoms, OpenFIGI rezoliucijai ir galutiniam VMI CSV generavimui.
+- Papildyta dokumentacija apie **taisyklių konfigūravimą, pattern kolekcijas, testų paleidimą ir OpenFIGI naudojimą**.
+
 ---
 
 ## 📋 VMI operacijų kodai (rusis)
@@ -90,6 +115,17 @@ Taisykles galite redaguoti `rules.yaml` faile.
 ### Valstybės žymėjimas (`valstybe`)
 
 `valstybe` stulpelis nustatomas eilutes lygiu: jei aprasyme randamas ISIN,
-naudojamas jo salies prefiksas (pvz. `US...` -> `US`, `LU...` -> `LU`),
-kitu atveju naudojama numatytoji salis is `rules.yaml` (`country`).
+instrumentas pirmiausia tikrinamas per OpenFIGI API pagal tą ISIN kodą.
+Jei API grąžina šalies kodą, naudojama jis; jei API laikinai nepasiekiamas
+arba negrąžina šalies lauko, naudojamas ISIN prefiksas (pvz. `US...` -> `US`,
+`LU...` -> `LU`). Jei ISIN apskritai nėra, naudojama numatytoji šalis iš
+`rules.yaml` (`country`).
+
+Jei reikia didesnių OpenFIGI limitų, galite nustatyti `OPENFIGI_API_KEY`
+aplinkos kintamąjį prieš paleidžiant `parse_ib.py`.
+
+Kai randamas ISIN, paleidimo metu loge matysite OpenFIGI užklausas ir Docker
+konteinerio loguose, pvz.: `[OpenFIGI] OpenFIGI cache miss for ISIN ...`,
+`[OpenFIGI] Accessing OpenFIGI for ISIN ...`,
+`[OpenFIGI] OpenFIGI resolved ISIN ... -> US` arba fallback / klaidos žinutes.
 

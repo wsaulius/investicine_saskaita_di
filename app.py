@@ -8,14 +8,17 @@ import csv
 import json
 import os
 from pathlib import Path
+from datetime import datetime
 from flask import Flask, render_template, request, jsonify
 
 app = Flask(__name__)
 
 # Configuration
 OUTPUT_DIR = Path(__file__).parent / 'output'
-CSV_PATH = OUTPUT_DIR / 'vmi_2025_annotated.csv'
-BACKUP_PATH = OUTPUT_DIR / 'vmi_2025_annotated.backup.csv'
+SOURCE_DIR = Path(__file__).parent / 'source'
+RULES_PATH = Path(__file__).parent / 'rules.yaml'
+DEFAULT_SOURCE_CSV = SOURCE_DIR / 'Swedbank_statement.csv'
+CSV_PATH_OVERRIDE = os.getenv('VMI_ANNOTATED_CSV_PATH')
 
 # VMI codes available for selection
 VMI_CODES = {
@@ -29,13 +32,52 @@ VMI_CODES = {
 }
 
 
+def _active_csv_paths():
+    """Resolve active annotated/plain CSV paths, preferring explicit env path or newest output file."""
+    if CSV_PATH_OVERRIDE:
+        annotated = Path(CSV_PATH_OVERRIDE)
+    else:
+        candidates = sorted(OUTPUT_DIR.glob('vmi_*_annotated.csv'), key=lambda p: p.stat().st_mtime, reverse=True)
+        annotated = candidates[0] if candidates else (OUTPUT_DIR / 'vmi_2025_annotated.csv')
+
+    plain_name = annotated.name.replace('_annotated.csv', '.csv')
+    plain = annotated.with_name(plain_name)
+    backup = annotated.with_suffix('.backup.csv')
+    return annotated, plain, backup
+
+
+def _refresh_outputs_if_source_newer():
+    """Regenerate output CSV when default source CSV is newer than current annotated output."""
+    source_path = Path(os.getenv('SWEDBANK_SOURCE_CSV_PATH', str(DEFAULT_SOURCE_CSV)))
+    if not source_path.exists():
+        return
+
+    annotated_path, _, _ = _active_csv_paths()
+    if annotated_path.exists() and source_path.stat().st_mtime <= annotated_path.stat().st_mtime:
+        return
+
+    try:
+        from parse_ib import load_swedbank_rules, parse_swedbank_csv, generate_vmi_csv
+
+        rules = load_swedbank_rules(str(RULES_PATH) if RULES_PATH.exists() else None)
+        stmt = parse_swedbank_csv(str(source_path), rules=rules)
+        year = int(stmt.period_end[:4]) if stmt.period_end else datetime.now().year
+        output_path = OUTPUT_DIR / f'vmi_{year}.csv'
+        generate_vmi_csv(stmt, str(output_path), year, country=rules.get('country', 'LT'))
+        print(f"[GUI] Refreshed output from source: {source_path}")
+    except Exception as exc:
+        print(f"[GUI] Warning: could not refresh output from source ({source_path}): {exc}")
+
+
 def load_csv():
     """Load annotated CSV file."""
-    if not CSV_PATH.exists():
+    _refresh_outputs_if_source_newer()
+    csv_path, _, _ = _active_csv_paths()
+    if not csv_path.exists():
         return []
 
     rows = []
-    with open(CSV_PATH, 'r', encoding='utf-8') as f:
+    with open(csv_path, 'r', encoding='utf-8') as f:
         reader = csv.DictReader(f)
         for i, row in enumerate(reader):
             row['_id'] = i
@@ -45,15 +87,17 @@ def load_csv():
 
 def save_csv(rows):
     """Save rows back to annotated CSV file."""
+    csv_path, plain_csv_path, backup_path = _active_csv_paths()
+
     # Create backup
-    if CSV_PATH.exists():
-        with open(CSV_PATH, 'r', encoding='utf-8') as src:
-            with open(BACKUP_PATH, 'w', encoding='utf-8') as dst:
+    if csv_path.exists():
+        with open(csv_path, 'r', encoding='utf-8') as src:
+            with open(backup_path, 'w', encoding='utf-8') as dst:
                 dst.write(src.read())
 
     # Write updated CSV
     fieldnames = ['saskaita', 'rusis', 'data', 'suma', 'valstybe', 'aprasymas']
-    with open(CSV_PATH, 'w', newline='', encoding='utf-8') as f:
+    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
@@ -62,9 +106,8 @@ def save_csv(rows):
             writer.writerow(clean_row)
 
     # Also update non-annotated version
-    csv_path = CSV_PATH.with_name('vmi_2025.csv')
     fieldnames_plain = ['saskaita', 'rusis', 'data', 'suma', 'valstybe']
-    with open(csv_path, 'w', newline='', encoding='utf-8') as f:
+    with open(plain_csv_path, 'w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames_plain)
         writer.writeheader()
         for row in rows:
